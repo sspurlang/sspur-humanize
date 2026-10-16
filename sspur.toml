@@ -1,0 +1,5 @@
+[package]
+name = "humanize"
+version = "0.1.0"
+description = "Human-readable numbers and times: byte sizes, durations, relative times, ordinals, plurals, lists, compact numbers, number words, Roman numerals, fractions"
+license = "MIT"

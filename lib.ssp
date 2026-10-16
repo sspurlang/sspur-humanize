@@ -1,0 +1,613 @@
+// Human-readable formatting: byte sizes, durations and relative times, ordinals, English plurals,
+// lists, compact numbers, thousands separators, numbers in words, Roman numerals, percentages,
+// fractions, scientific notation and SI prefixes, with parsers back for the sizes, durations and
+// compact numbers. Everything is pure and English; the builtin Locale formats numbers and dates
+// for other locales.
+
+// ---------- byte sizes ----------
+
+// `n` bytes in SI units (powers of 1000: B, kB, MB, GB, TB, PB, EB) with one decimal and trailing
+// zeros dropped: "999 B", "1 kB", "1.5 kB", "-2.3 MB". Rounding can carry into the next unit
+// (999950 is "1 MB").
+pub fn format_bytes(n: Int) -> Str
+= format_bytes_with(n, false, 1)
+
+// `n` bytes in IEC units (powers of 1024: B, KiB, MiB, GiB, TiB, PiB, EiB) with one decimal and
+// trailing zeros dropped: "1 KiB", "1.5 MiB".
+pub fn format_bytes_iec(n: Int) -> Str
+= format_bytes_with(n, true, 1)
+
+// `n` bytes in IEC units when `binary`, else SI units, with at most `decimals` decimals (0 to 10,
+// trailing zeros dropped). Sizes below one kilobyte are whole bytes ("512 B").
+pub fn format_bytes_with(n: Int, binary: Bool, decimals: Int where _ >= 0 and _ <= 10) -> Str
+  ex format_bytes_with(1536, true, 2) == "1.5 KiB"
+= do
+  base = if binary then 1024.0 else 1000.0
+  units = if binary then ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] else ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
+  x = n.to_f64.abs
+  if x < base then "{n} B" else do
+    (v, k) = scale_down(x, base, decimals)
+    (if n < 0 then "-" else "") + trim_zeros(v.fmt(decimals)) + " " + units[k]
+
+fn scale_down(x: F64, base: F64, decimals: Int) -> (F64, Int)
+= do
+  var v = x
+  var k = 0
+  for _ in 0..6
+    if v >= base then do
+      v := v / base
+      k := k + 1
+  if k < 6 and v.fmt(decimals).to_f64.or(0.0) >= base then (v / base, k + 1) else (v, k)
+
+fn trim_zeros(s: Str) -> Str
+= if not s.contains(".") then s else do
+  t = strip_trailing(s, "0")
+  if t.ends_with(".") then t.take(t.len - 1) else t
+
+fn strip_trailing(s: Str, c: Str) -> Str
+= do
+  var n = s.len
+  for _ in 0..s.len
+    if n > 0 and s.get(n - 1) == some(c) then n := n - 1
+  s.take(n)
+
+// Parses a byte size such as "1.5 GB", "10MiB", "512", "2 kb" or "3 bytes" to a number of bytes,
+// rounded to the nearest byte (ties to even). Units are case-insensitive: B (or byte, bytes), the
+// SI units K/KB (1000), M/MB, G/GB, T/TB, P/PB, E/EB, and the IEC units KiB (1024), MiB, GiB, TiB,
+// PiB, EiB. `none` for an unknown unit, malformed text or a size beyond Int.
+pub fn parse_bytes(s: Str) -> Opt[Int]
+= match rx("^([+-]?\\d+(?:\\.\\d+)?)\\s*([A-Za-z]*)$", s.trim)
+| some([_, num, unit]) => scaled_opt(num, byte_unit(unit.lower))
+| _ => none
+
+fn byte_unit(u: Str) -> Opt[Str]
+= do
+  si = ["k", "m", "g", "t", "p", "e"]
+  if u == "" or u == "b" or u == "byte" or u == "bytes" then some("1") else match si.index_of(u.take(1))
+  | some(i) => if u.len == 1 or u == u.take(1) + "b" then some(pow_str(1000, i + 1)) else if u == u.take(1) + "ib" then some(pow_str(1024, i + 1)) else none
+  | none => none
+
+fn pow_str(b: Int, e: Int) -> Str
+= big(b).pow(e).str
+
+fn scaled_opt(num: Str, mult: Opt[Str]) -> Opt[Int]
+= match mult
+| some(m) => scaled(num, m)
+| none => none
+
+fn scaled(num: Str, mult: Str) -> Opt[Int]
+= match (decimal(num), decimal(mult))
+| (some(a), some(m)) => a.mul(m).round(0).str.to_int
+| _ => none
+
+fn rx(p: Str, s: Str) -> Opt[List[Str]]
+= match regex(p)
+| ok(r) => r.captures(s)
+| err(_) => none
+
+// ---------- durations ----------
+
+fn unit_parts(ms: Int) -> List[(Int, Str, Str)]
+= [(ms / 86400000, "d", "day"), (ms % 86400000 / 3600000, "h", "hour"), (ms % 3600000 / 60000, "m", "minute"), (ms % 60000 / 1000, "s", "second"), (ms % 1000, "ms", "millisecond")]
+
+// Duration `d` precisely and compactly, largest unit first, zero parts left out: "1d 2h 3m 4s",
+// "1s 250ms", "250ms", "0ms" for zero, "-1h 30m" for a negative duration.
+pub fn format_duration(d: Duration) -> Str
+= format_ms(d.ms)
+
+// `ms` milliseconds as format_duration writes them.
+pub fn format_ms(ms: Int) -> Str
+= do
+  parts = unit_parts(ms).filter(_.0 != 0).map(p => "{p.0.abs}{p.1}")
+  if parts.is_empty then "0ms" else (if ms < 0 then "-" else "") + parts.join(" ")
+
+// Duration `d` in words, largest unit first, zero parts left out: "1 hour, 2 minutes and 3
+// seconds", "250 milliseconds", "0 seconds" for zero, "minus 2 days" for a negative duration.
+pub fn format_duration_long(d: Duration) -> Str
+= do
+  ms = d.ms
+  parts = unit_parts(ms).filter(_.0 != 0).map(p => count_unit(p.0.abs, p.2))
+  if parts.is_empty then "0 seconds" else (if ms < 0 then "minus " else "") + join_list(parts)
+
+fn count_unit(n: Int, unit: Str) -> Str
+= if n == 1 then "1 " + unit else "{n} {unit}s"
+
+// Duration `d` approximately, as Rails' distance_of_time_in_words words it (the sign is ignored):
+// "less than a minute" (under 30 seconds), "1 minute", "5 minutes", "about 1 hour", "about 3
+// hours" (to 23.5 hours), "1 day", "12 days", "about 1 month", "4 months", "about 1 year",
+// "over 2 years", "almost 3 years". Minutes are rounded to the nearest one first.
+pub fn approximate_duration(d: Duration) -> Str
+= do
+  m = d.ms.abs / 1000 / 60 + (if d.ms.abs / 1000 % 60 >= 30 then 1 else 0)
+  if m == 0 then "less than a minute" else if m == 1 then "1 minute" else if m < 45 then "{m} minutes" else if m < 90 then "about 1 hour" else if m < 1440 then "about {rdiv(m, 60)} hours" else if m < 2520 then "1 day" else if m < 43200 then "{rdiv(m, 1440)} days" else if m < 86400 then "about 1 month" else if m < 525600 then "{rdiv(m, 43200)} months" else years_words(m)
+
+fn rdiv(a: Int, b: Int) -> Int
+= (a + b / 2) / b
+
+fn years_words(m: Int) -> Str
+= do
+  y = m / 525600
+  rem = m % 525600
+  if rem < 131400 then "about " + count_unit(y, "year") else if rem < 394200 then "over " + count_unit(y, "year") else "almost " + count_unit(y + 1, "year")
+
+// A time `d` away from now in words, where `d` is `t.since(now)`: positive is in the future and
+// negative in the past. Under 10 seconds either way is "just now"; otherwise it is
+// approximate_duration with "ago" or "in": "3 minutes ago", "in about 2 hours".
+pub fn relative_time(d: Duration) -> Str
+= if d.ms.abs < 10000 then "just now" else if d.ms < 0 then approximate_duration(d) + " ago" else "in " + approximate_duration(d)
+
+// Parses a duration: one or more parts, each a number (a fraction is allowed) and a unit, with
+// optional spaces, commas and "and" between them: "1h30m", "90s", "1.5h", "250ms", "2 days, 3
+// hours and 4 minutes", "-1h". Units: ms (msec, millisecond), s (sec, second), m (min, minute),
+// h (hr, hour), d (day), w (wk, week), singular or plural, case-insensitive. The total is rounded
+// to the nearest millisecond (ties to even). `none` for a bare number, an unknown unit or a
+// total beyond Int.
+pub fn parse_duration(s: Str) -> Opt[Duration]
+= do
+  t = s.lower.trim
+  neg = t.starts_with("-")
+  body = (if neg or t.starts_with("+") then t.drop(1) else t).replace(",", " ").replace(" and ", " ").replace(" ", "").replace("\t", "")
+  ok_shape = match regex("^(\\d+(?:\\.\\d+)?[a-z]+)+$")
+  | ok(r) => r.is_match(body)
+  | err(_) => false
+  parts = match regex("(\\d+(?:\\.\\d+)?)([a-z]+)")
+  | ok(r) => r.find_all(body)
+  | err(_) => []
+  if not ok_shape then none else sum_parts(parts, neg)
+
+fn sum_parts(parts: List[Str], neg: Bool) -> Opt[Duration]
+= do
+  var total = decimal("0")
+  for p in parts
+    total := add_part(total, p)
+  match total
+  | some(v) => v.round(0).str.to_int.map(ms => millis(if neg then -ms else ms))
+  | none => none
+
+fn add_part(total: Opt[Dec], p: Str) -> Opt[Dec]
+= match rx("^(\\d+(?:\\.\\d+)?)([a-z]+)$", p)
+| some([_, n, u]) => mul_add(total, decimal(n), duration_unit(u))
+| _ => none
+
+fn mul_add(total: Opt[Dec], x: Opt[Dec], m: Opt[Dec]) -> Opt[Dec]
+= match (total, x, m)
+| (some(acc), some(a), some(b)) => some(acc.add(a.mul(b)))
+| _ => none
+
+fn duration_unit(u: Str) -> Opt[Dec]
+= do
+  table = [(["ms", "msec", "msecs", "millisecond", "milliseconds"], "1"), (["s", "sec", "secs", "second", "seconds"], "1000"), (["m", "min", "mins", "minute", "minutes"], "60000"), (["h", "hr", "hrs", "hour", "hours"], "3600000"), (["d", "day", "days"], "86400000"), (["w", "wk", "wks", "week", "weeks"], "604800000")]
+  match table.find(e => e.0.contains(u))
+  | some(e) => decimal(e.1)
+  | none => none
+
+// ---------- ordinals ----------
+
+// The English ordinal suffix of `n`: "st", "nd", "rd" or "th" (11, 12 and 13 take "th", as do
+// 111, 112 and 113). The sign is ignored.
+pub fn ordinal_suffix(n: Int) -> Str
+= do
+  digits = n.str.replace("-", "")
+  last2 = digits.drop(max(digits.len - 2, 0)).to_int.or(0)
+  if last2 >= 11 and last2 <= 13 then "th" else match last2 % 10
+  | 1 => "st"
+  | 2 => "nd"
+  | 3 => "rd"
+  | _ => "th"
+
+// `n` with its ordinal suffix: "1st", "2nd", "3rd", "11th", "21st", "111th", "-1st" (a negative
+// number keeps its sign and takes the suffix of its magnitude).
+pub fn ordinal(n: Int) -> Str
+= n.str + ordinal_suffix(n)
+
+// ---------- plurals ----------
+
+fn irregulars() -> List[(Str, Str)]
+= [("person", "people"), ("man", "men"), ("woman", "women"), ("child", "children"), ("tooth", "teeth"), ("foot", "feet"), ("mouse", "mice"), ("goose", "geese"), ("ox", "oxen"), ("louse", "lice"), ("die", "dice"), ("datum", "data"), ("criterion", "criteria"), ("phenomenon", "phenomena"), ("index", "indices"), ("matrix", "matrices"), ("vertex", "vertices"), ("appendix", "appendices"), ("cactus", "cacti"), ("focus", "foci"), ("fungus", "fungi"), ("nucleus", "nuclei"), ("radius", "radii"), ("stimulus", "stimuli"), ("syllabus", "syllabi"), ("alumnus", "alumni"), ("medium", "media"), ("curriculum", "curricula"), ("memorandum", "memoranda"), ("quiz", "quizzes"), ("axis", "axes"), ("leaf", "leaves"), ("life", "lives"), ("knife", "knives"), ("wife", "wives"), ("half", "halves"), ("wolf", "wolves"), ("shelf", "shelves"), ("calf", "calves"), ("elf", "elves"), ("loaf", "loaves"), ("thief", "thieves"), ("self", "selves"), ("scarf", "scarves"), ("hoof", "hooves"), ("potato", "potatoes"), ("tomato", "tomatoes"), ("hero", "heroes"), ("echo", "echoes"), ("veto", "vetoes"), ("torpedo", "torpedoes"), ("embargo", "embargoes"), ("volcano", "volcanoes"), ("mosquito", "mosquitoes"), ("buffalo", "buffaloes"), ("domino", "dominoes"), ("movie", "movies"), ("cookie", "cookies"), ("pie", "pies"), ("tie", "ties"), ("lie", "lies"), ("zombie", "zombies"), ("rookie", "rookies"), ("calorie", "calories"), ("prairie", "prairies"), ("brownie", "brownies"), ("selfie", "selfies"), ("bus", "buses"), ("status", "statuses"), ("virus", "viruses"), ("campus", "campuses"), ("bonus", "bonuses"), ("census", "censuses"), ("chorus", "choruses"), ("circus", "circuses"), ("octopus", "octopuses"), ("walrus", "walruses"), ("surplus", "surpluses"), ("gas", "gases"), ("lens", "lenses"), ("canvas", "canvases"), ("atlas", "atlases"), ("iris", "irises"), ("analysis", "analyses"), ("basis", "bases"), ("crisis", "crises"), ("thesis", "theses"), ("diagnosis", "diagnoses"), ("hypothesis", "hypotheses"), ("oasis", "oases"), ("parenthesis", "parentheses"), ("synopsis", "synopses"), ("ellipsis", "ellipses")]
+
+fn uncountables() -> List[Str]
+= ["advice", "aircraft", "bison", "chassis", "deer", "equipment", "evidence", "feedback", "fish", "furniture", "homework", "information", "jeans", "knowledge", "luggage", "metadata", "moose", "music", "news", "offspring", "police", "rice", "salmon", "series", "sheep", "shrimp", "software", "species", "swine", "traffic", "trout", "tuna", "money", "staff", "hardware", "garbage", "weather"]
+
+fn match_case(model: Str, w: Str) -> Str
+= if model.len > 1 and model == model.upper and model != model.lower then w.upper else if model.take(1) == model.take(1).upper and model.take(1) != model.take(1).lower then w.take(1).upper + w.drop(1) else w
+
+// The plural of English noun `word`: irregular nouns ("person" to "people", "child" to
+// "children", "leaf" to "leaves", "analysis" to "analyses", "cactus" to "cacti"), uncountable
+// ones unchanged ("sheep", "information"), then the rules for "-y" after a consonant ("-ies"),
+// "-s -x -z -ch -sh" ("-es") and otherwise "-s". The case of `word` is kept: "Box" gives "Boxes"
+// and "BOX" gives "BOXES". An empty word stays empty.
+pub fn pluralize(word: Str) -> Str
+= do
+  w = word.lower
+  if w == "" or uncountables().contains(w) then word else match irregulars().find(p => p.0 == w)
+  | some(p) => match_case(word, p.1)
+  | none => if irregulars().any(p => p.1 == w) then word else match_case(word, plural_rule(w))
+
+fn is_vowel(c: Str) -> Bool
+= "aeiou".contains(c) and c != ""
+
+fn plural_rule(w: Str) -> Str
+= if w.ends_with("y") and w.len > 1 and not is_vowel(w.drop(w.len - 2).take(1)) then w.take(w.len - 1) + "ies" else if w.ends_with("s") or w.ends_with("x") or w.ends_with("z") or w.ends_with("ch") or w.ends_with("sh") then w + "es" else w + "s"
+
+// The singular of English noun `word`, undoing pluralize: irregular plurals ("people", "mice",
+// "wolves", "crises"), uncountable nouns unchanged, then "-ies" to "-y", "-sses" to "-ss",
+// "-xes -zes -ches -shes" without "-es", and a final "-s" dropped unless the word ends in "ss",
+// "us" or "is". A word that is already singular is returned unchanged where the rules can tell.
+// The case of `word` is kept.
+pub fn singularize(word: Str) -> Str
+= do
+  w = word.lower
+  if w == "" or uncountables().contains(w) then word else match irregulars().find(p => p.1 == w)
+  | some(p) => match_case(word, p.0)
+  | none => if irregulars().any(p => p.0 == w) then word else match_case(word, singular_rule(w))
+
+fn singular_rule(w: Str) -> Str
+= if w.ends_with("ies") and w.len > 3 then w.take(w.len - 3) + "y" else if w.ends_with("sses") or w.ends_with("xes") or w.ends_with("zes") or w.ends_with("ches") or w.ends_with("shes") then w.take(w.len - 2) else if w.ends_with("s") and not (w.ends_with("ss") or w.ends_with("us") or w.ends_with("is")) then w.take(w.len - 1) else w
+
+// `word` if `n` is 1 (or -1), else its plural.
+pub fn plural_for(n: Int, word: Str) -> Str
+= if n == 1 or n == -1 then word else pluralize(word)
+
+// `n` and the noun, with thousands separators: "1 file", "0 files", "1,234 files", "-1 file".
+pub fn count_noun(n: Int, word: Str) -> Str
+= n.format(",") + " " + plural_for(n, word)
+
+// Like count_noun but zero is "no": "no files", "1 file", "3 files".
+pub fn quantity(n: Int, word: Str) -> Str
+= if n == 0 then "no " + pluralize(word) else count_noun(n, word)
+
+// ---------- lists ----------
+
+// The items joined as an English list with "and" and no serial comma: "" for none, "a", "a and
+// b", "a, b and c".
+pub fn join_list(xs: List[Str]) -> Str
+= join_words(xs, "and", false)
+
+// The items joined with "and" and the serial (Oxford) comma: "a, b, and c" ("a and b" for two).
+pub fn join_list_oxford(xs: List[Str]) -> Str
+= join_words(xs, "and", true)
+
+// The items joined with "or": "a, b or c".
+pub fn join_or(xs: List[Str]) -> Str
+= join_words(xs, "or", false)
+
+// The items joined with commas and conjunction `conj` before the last one, with a comma before
+// it too when `oxford` and there are at least three items.
+pub fn join_words(xs: List[Str], conj: Str, oxford: Bool) -> Str
+= match xs
+| [] => ""
+| [a] => a
+| [a, b] => "{a} {conj} {b}"
+| [..init, z] => init.join(", ") + (if oxford then ", " else " ") + conj + " " + z
+
+// The first `limit` items and a count of the rest: "a, b and 3 others" ("and 1 other"); all of
+// them as join_list when there are at most `limit`. With `limit` 0 only the count is left
+// ("5 others").
+pub fn join_truncated(xs: List[Str], limit: Int where _ >= 0) -> Str
+  post xs.len > limit or r == join_list(xs)
+= if xs.len <= limit then join_list(xs) else do
+  rest = xs.len - limit
+  others = if rest == 1 then "1 other" else "{rest} others"
+  if limit == 0 then others else xs.take(limit).join(", ") + " and " + others
+
+// ---------- numbers ----------
+
+// `n` with commas between groups of three digits: "1,234,567", "-1,000".
+pub fn with_commas(n: Int) -> Str
+= n.format(",")
+
+// `n` with `sep` between groups of three digits: group_digits(1234567, " ") is "1 234 567".
+pub fn group_digits(n: Int, sep: Str) -> Str
+= n.format(",").replace(",", sep)
+
+// `x` with commas between groups of three digits and exactly `decimals` decimals:
+// "1,234.57". NaN and infinities are written "nan", "inf" and "-inf".
+pub fn with_commas_f64(x: F64, decimals: Int where _ >= 0 and _ <= 20) -> Str
+  ex with_commas_f64(1234.5678, 2) == "1,234.57"
+= if x.is_nan then "nan" else if x.is_inf then (if x < 0.0 then "-inf" else "inf") else x.format(",.{decimals}f")
+
+fn compact_units() -> List[(Int, Str, Str)]
+= [(1000000000000, "T", "trillion"), (1000000000, "B", "billion"), (1000000, "M", "million"), (1000, "k", "thousand")]
+
+// `n` in short compact form with one decimal at most: "999", "1.2k", "3.4M", "1.2B", "1T",
+// "-1.5k". The value is rounded half away from zero, and rounding can carry into the next unit
+// (999950 is "1M", 999949 is "999.9k"). Above 999.95 trillion it stays in trillions with
+// separators ("9,223,372T").
+pub fn compact(n: Int) -> Str
+= compact_with(n, 1, false)
+
+// `n` in long compact form: "1.2 thousand", "3.4 million", "1 billion", "2 trillion".
+pub fn compact_long(n: Int) -> Str
+= compact_with(n, 1, true)
+
+// `n` in compact form with at most `decimals` decimals (trailing zeros dropped), short ("1.23k")
+// or `long` ("1.23 thousand").
+pub fn compact_with(n: Int, decimals: Int where _ >= 0 and _ <= 6, long: Bool) -> Str
+  ex compact_with(1234, 2, false) == "1.23k"
+= do
+  a = big(n).abs
+  if a < big(1000) then n.str else do
+    us = compact_units()
+    i = us.find_index(u => a >= big(u.0)).or(3)
+    scale = big(10).pow(decimals)
+    q = round_div(a.mul(scale), big(us[i].0))
+    (j, v) = if i > 0 and q >= big(1000).mul(scale) then (i - 1, round_div(a.mul(scale), big(us[i - 1].0))) else (i, q)
+    text = big_fixed(v, decimals)
+    (if n < 0 then "-" else "") + text + (if long then " " + us[j].2 else us[j].1)
+
+fn round_div(a: BigInt, b: BigInt) -> BigInt
+= do
+  (q, r) = a.divmod(b)
+  if r.mul(big(2)) >= b then q.add(big(1)) else q
+
+fn big_fixed(v: BigInt, decimals: Int) -> Str
+= do
+  s = v.str.pad_left(decimals + 1, "0")
+  whole = s.take(s.len - decimals)
+  frac = s.drop(s.len - decimals)
+  w = whole.to_int.map(_.format(",")).or(whole)
+  if decimals == 0 then w else trim_zeros(w + "." + frac)
+
+// Parses a compact number back to an Int: "1.2k" (1200), "3.4M", "1.5 billion", "2T", "-1,500",
+// "750". Suffixes are case-insensitive: k or thousand, m or million, b, bn or billion, t, tn or
+// trillion. The value is rounded to the nearest integer (ties to even). `none` for malformed text,
+// an unknown suffix or a value beyond Int.
+pub fn parse_compact(s: Str) -> Opt[Int]
+= match rx("^([+-]?\\d+(?:,\\d\{3})*(?:\\.\\d+)?)\\s*([A-Za-z]*)$", s.trim)
+| some([_, num, suffix]) => scaled_opt(num.replace(",", ""), compact_mult(suffix.lower))
+| _ => none
+
+fn compact_mult(u: Str) -> Opt[Str]
+= if u == "" then some("1") else if u == "k" or u == "thousand" then some("1000") else if u == "m" or u == "million" then some("1000000") else if u == "b" or u == "bn" or u == "billion" then some("1000000000") else if u == "t" or u == "tn" or u == "trillion" then some("1000000000000") else none
+
+// ---------- numbers in words ----------
+
+fn ones() -> List[Str]
+= ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+
+fn tens() -> List[Str]
+= ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+fn below_thousand(n: Int) -> Str
+= do
+  h = n / 100
+  r = n % 100
+  low = if r < 20 then ones()[r] else tens()[r / 10] + (if r % 10 == 0 then "" else "-" + ones()[r % 10])
+  if h == 0 then low else ones()[h] + " hundred" + (if r == 0 then "" else " " + low)
+
+// `n` in English words, in the US style without "and": "zero", "seven", "forty-two",
+// "one hundred twenty-three", "minus five", "one million two thousand three". Every Int works,
+// up to the quintillions of the smallest one.
+pub fn number_words(n: Int) -> Str
+= do
+  digits = n.str.replace("-", "")
+  if digits == "0" then "zero" else do
+    scales = ["", " thousand", " million", " billion", " trillion", " quadrillion", " quintillion"]
+    groups = (0..(digits.len + 2) / 3).map(k => digits.drop(max(digits.len - 3 * k - 3, 0)).take(digits.len - 3 * k - max(digits.len - 3 * k - 3, 0)).to_int.or(0))
+    words = groups.enumerate.filter(g => g.1 != 0).reverse.map(g => below_thousand(g.1) + scales[g.0])
+    (if n < 0 then "minus " else "") + words.join(" ")
+
+// `n` as an English ordinal in words: "first", "second", "twelfth", "twenty-first",
+// "one hundredth", "one million second", "minus third".
+pub fn ordinal_words(n: Int) -> Str
+= do
+  w = number_words(n)
+  cut = max(last_index(w, " "), last_index(w, "-")) + 1
+  w.take(cut) + ordinal_word(w.drop(cut))
+
+fn last_index(s: Str, c: Str) -> Int
+= s.chars.enumerate.filter(p => p.1 == c).map(_.0).last.or(-1)
+
+fn ordinal_word(w: Str) -> Str
+= match w
+| "one" => "first"
+| "two" => "second"
+| "three" => "third"
+| "five" => "fifth"
+| "eight" => "eighth"
+| "nine" => "ninth"
+| "twelve" => "twelfth"
+| _ => if w.ends_with("y") then w.take(w.len - 1) + "ieth" else w + "th"
+
+// `n` in Associated Press style: words for 0 to 9 ("zero" to "nine"), digits otherwise ("10",
+// "-3").
+pub fn apnumber(n: Int) -> Str
+= if n >= 0 and n <= 9 then ones()[n] else n.str
+
+// ---------- Roman numerals ----------
+
+fn roman_table() -> List[(Int, Str)]
+= [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+
+// `n` as a Roman numeral in the standard subtractive form: 4 is "IV", 1994 is "MCMXCIV", 3999 is
+// "MMMCMXCIX".
+pub fn to_roman(n: Int where _ >= 1 and _ <= 3999) -> Str
+  ex to_roman(1994) == "MCMXCIV"
+= do
+  var left = n
+  var out = ""
+  for p in roman_table()
+    for _ in 0..3
+      if left >= p.0 then do
+        out := out + p.1
+        left := left - p.0
+  out
+
+// Parses a Roman numeral in the standard form to_roman writes, upper case only: "XIV" is 14.
+// Non-standard forms ("IIII", "IC", "VX", "MMMM") and anything else give `none`.
+pub fn from_roman(s: Str) -> Opt[Int]
+= do
+  vals = s.chars.map(c => roman_table().find(p => p.1 == c).map(_.0).or(0))
+  if s == "" or vals.contains(0) then none else do
+    total = vals.enumerate.fold(0, (acc, p) => if vals.get(p.0 + 1).or(0) > p.1 then acc - p.1 else acc + p.1)
+    if total >= 1 and total <= 3999 and to_roman(total) == s then some(total) else none
+
+// ---------- percentages, fractions and magnitudes ----------
+
+// The ratio `x` as a percentage with exactly `decimals` decimals: percent(0.125, 1) is "12.5%".
+pub fn percent(x: F64, decimals: Int where _ >= 0 and _ <= 20) -> Str
+  ex percent(0.5, 0) == "50%"
+= (x * 100.0).fmt(decimals) + "%"
+
+// `part` of `whole` as a percentage with exactly `decimals` decimals: percent_of(1, 3, 1) is
+// "33.3%".
+pub fn percent_of(part: Int, whole: Int where _ != 0, decimals: Int where _ >= 0 and _ <= 20) -> Str
+  ex percent_of(1, 3, 1) == "33.3%"
+= percent(part.to_f64 / whole.to_f64, decimals)
+
+// The fraction closest to `x` whose denominator is at most `max_den`, as (numerator, denominator)
+// in lowest terms with a positive denominator: fraction_parts(0.75, 100) is (3, 4),
+// fraction_parts(3.14159, 10) is (22, 7).
+pub fn fraction_parts(x: F64, max_den: Int where _ >= 1) -> (Int, Int)
+  pre x.is_finite and x.abs < 1000000000000.0
+  post r.1 >= 1 and r.1 <= max_den
+= do
+  a = x.abs
+  w = a.floor
+  (p, q) = best_fraction(a - w.to_f64, max_den)
+  num = w * q + p
+  if x < 0.0 then (-num, q) else (num, q)
+
+fn best_fraction(f: F64, n: Int) -> (Int, Int)
+= do
+  var p0 = 0
+  var q0 = 1
+  var p1 = 1
+  var q1 = 0
+  var v = f
+  var done = false
+  for _ in 0..64
+    if not done then do
+      a = v.floor
+      q2 = q0 + a * q1
+      if q2 > n then done := true else do
+        p2 = p0 + a * p1
+        p0 := p1
+        q0 := q1
+        p1 := p2
+        q1 := q2
+        frac = v - a.to_f64
+        if frac < 1e-12 then done := true else v := 1.0 / frac
+  k = if q1 == 0 then 0 else (n - q0) / q1
+  (bp, bq) = (p0 + k * p1, q0 + k * q1)
+  if q1 == 0 then (0, 1) else if (bp.to_f64 / bq.to_f64 - f).abs < (p1.to_f64 / q1.to_f64 - f).abs then (bp, bq) else (p1, q1)
+
+// `x` as a mixed fraction with denominator at most `max_den`: "1/2", "1 1/2", "-2 3/4", "3" for a
+// whole number, "0" for values that round to zero.
+pub fn fraction(x: F64, max_den: Int where _ >= 1) -> Str
+  pre x.is_finite and x.abs < 1000000000000.0
+  ex fraction(1.5, 16) == "1 1/2"
+= do
+  (p, q) = fraction_parts(x, max_den)
+  w = p.abs / q
+  r = p.abs % q
+  sign = if p < 0 then "-" else ""
+  if r == 0 then sign + w.str else if w == 0 then "{sign}{r}/{q}" else "{sign}{w} {r}/{q}"
+
+fn superscript(s: Str) -> Str
+= s.chars.map(c => do
+  match "0123456789".index_of(c)
+  | some(i) => ["⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹"][i]
+  | none => if c == "-" then "⁻" else "").join("")
+
+// `x` in scientific notation with `decimals` decimals in the mantissa and a superscript
+// exponent: scientific(12345.0, 2) is "1.23 x 10⁴", scientific(0.00042, 1) is "4.2 x 10⁻⁴". NaN
+// and infinities are written "nan", "inf" and "-inf".
+pub fn scientific(x: F64, decimals: Int where _ >= 0 and _ <= 20) -> Str
+  ex scientific(12345.0, 2) == "1.23 x 10⁴"
+= if x.is_nan then "nan" else if x.is_inf then (if x < 0.0 then "-inf" else "inf") else match x.format(".{decimals}e").split_once("e")
+| some((m, e)) => m + " x 10" + superscript(e.to_int.or(0).str)
+| none => x.str
+
+// `x` with an SI prefix for `unit` and `decimals` decimals (trailing zeros dropped): metric(1500.0,
+// "V", 2) is "1.5 kV", metric(0.000002, "F", 1) is "2 µF". Prefixes run from y (10^-24) to Y
+// (10^24); rounding can carry into the next prefix (999.96 with one decimal is "1 k"). Zero is
+// "0 " plus the unit; NaN and infinities are written "nan", "inf" and "-inf" before the unit.
+pub fn metric(x: F64, unit: Str, decimals: Int where _ >= 0 and _ <= 20) -> Str
+  ex metric(1500.0, "V", 2) == "1.5 kV"
+= if x.is_nan or x.is_inf then (if x.is_nan then "nan" else if x < 0.0 then "-inf" else "inf") + " " + unit else if x == 0.0 then "0 " + unit else do
+  prefixes = ["y", "z", "a", "f", "p", "n", "µ", "m", "", "k", "M", "G", "T", "P", "E", "Z", "Y"]
+  e3 = clamp((x.abs.log10 / 3.0).floor, -8, 8)
+  v = x / 10.0.pow((e3 * 3).to_f64)
+  (v2, e2) = if v.abs.fmt(decimals).to_f64.or(0.0) >= 1000.0 and e3 < 8 then (v / 1000.0, e3 + 1) else (v, e3)
+  trim_zeros(v2.fmt(decimals)) + " " + prefixes[e2 + 8] + unit
+
+// ---------- tests ----------
+
+test bytes_si = format_bytes(0) == "0 B" and format_bytes(1) == "1 B" and format_bytes(999) == "999 B" and format_bytes(1000) == "1 kB" and format_bytes(1500) == "1.5 kB" and format_bytes(999949) == "999.9 kB" and format_bytes(999950) == "1 MB" and format_bytes(-2300000) == "-2.3 MB" and format_bytes(1000000000000000000) == "1 EB" and format_bytes(9223372036854775807) == "9.2 EB" and format_bytes(-9223372036854775807 - 1) == "-9.2 EB"
+
+test bytes_iec = format_bytes_iec(1023) == "1023 B" and format_bytes_iec(1024) == "1 KiB" and format_bytes_iec(1536) == "1.5 KiB" and format_bytes_iec(1048576) == "1 MiB" and format_bytes_iec(1073741824 * 3) == "3 GiB" and format_bytes_iec(1048575) == "1 MiB"
+
+test bytes_decimals = format_bytes_with(1234567, false, 3) == "1.235 MB" and format_bytes_with(1234567, false, 0) == "1 MB" and format_bytes_with(1500, true, 2) == "1.46 KiB" and format_bytes_with(-5, true, 2) == "-5 B"
+
+test bytes_parse = parse_bytes("1.5 GB") == some(1500000000) and parse_bytes("10MiB") == some(10485760) and parse_bytes("512") == some(512) and parse_bytes("2 kb") == some(2000) and parse_bytes("3 bytes") == some(3) and parse_bytes("1 KiB") == some(1024) and parse_bytes(" 7k ") == some(7000) and parse_bytes("1 EiB") == some(1152921504606846976) and parse_bytes("0.5 B") == some(0) and parse_bytes("1.5 B") == some(2)
+
+test bytes_parse_rejects = ["", "GB", "1.5 XB", "1..5 GB", "1 kib bytes", "8 EiB", "100 EB", "1,000 B", "1 kbs", "- 1 B"].all(s => parse_bytes(s) == none)
+
+test bytes_round_trip = [0, 1, 999, 1000, 1500, 2300000, 123000000].all(n => parse_bytes(format_bytes(n)) == some(n))
+
+test durations_short = format_duration(millis(0)) == "0ms" and format_duration(millis(250)) == "250ms" and format_duration(millis(1250)) == "1s 250ms" and format_duration(hours(1).add(mins(2)).add(secs(3))) == "1h 2m 3s" and format_duration(days(1).add(hours(2)).add(mins(3)).add(secs(4))) == "1d 2h 3m 4s" and format_duration(millis(-5400000)) == "-1h 30m" and format_ms(86400000) == "1d" and format_ms(-1) == "-1ms"
+
+test durations_extreme = format_ms(9223372036854775807) == "106751991167d 7h 12m 55s 807ms" and format_ms(-9223372036854775807 - 1) == "-106751991167d 7h 12m 55s 808ms"
+
+test durations_long = format_duration_long(millis(0)) == "0 seconds" and format_duration_long(hours(1).add(mins(2)).add(secs(3))) == "1 hour, 2 minutes and 3 seconds" and format_duration_long(millis(250)) == "250 milliseconds" and format_duration_long(days(2).neg) == "minus 2 days" and format_duration_long(mins(1).add(millis(1))) == "1 minute and 1 millisecond"
+
+test durations_approx = approximate_duration(secs(29)) == "less than a minute" and approximate_duration(secs(30)) == "1 minute" and approximate_duration(mins(5)) == "5 minutes" and approximate_duration(mins(44)) == "44 minutes" and approximate_duration(mins(45)) == "about 1 hour" and approximate_duration(hours(3)) == "about 3 hours" and approximate_duration(hours(30)) == "1 day" and approximate_duration(days(12)) == "12 days" and approximate_duration(days(40)) == "about 1 month" and approximate_duration(days(120)) == "4 months" and approximate_duration(days(400)) == "about 1 year" and approximate_duration(days(900)) == "over 2 years" and approximate_duration(days(1050)) == "almost 3 years" and approximate_duration(mins(5).neg) == "5 minutes"
+
+test relative_times = relative_time(secs(5)) == "just now" and relative_time(secs(-9)) == "just now" and relative_time(mins(-3)) == "3 minutes ago" and relative_time(hours(2)) == "in about 2 hours" and relative_time(days(-1)) == "1 day ago" and relative_time(secs(20)) == "in less than a minute"
+
+test duration_parse = parse_duration("1h30m") == some(mins(90)) and parse_duration("90s") == some(secs(90)) and parse_duration("1.5h") == some(mins(90)) and parse_duration("250ms") == some(millis(250)) and parse_duration("2 days, 3 hours and 4 minutes") == some(days(2).add(hours(3)).add(mins(4))) and parse_duration("-1h") == some(hours(-1)) and parse_duration("1W 1D") == some(days(8)) and parse_duration("0.0015s") == some(millis(2)) and parse_duration("1 hour") == some(hours(1))
+
+test duration_parse_rejects = ["", "90", "h", "1x", "1h30", "1 lightyear", "1.h", "--1h", "1h -30m", "99999999999999999w", "1us"].all(s => parse_duration(s) == none)
+
+test duration_round_trip = [0, 1, 999, 1000, 61001, 90061001, -5400000].all(ms => parse_duration(format_ms(ms).replace("-", "")).map(d => if ms < 0 then -d.ms else d.ms) == some(ms) or ms == 0)
+
+test ordinals = ordinal(1) == "1st" and ordinal(2) == "2nd" and ordinal(3) == "3rd" and ordinal(4) == "4th" and ordinal(11) == "11th" and ordinal(12) == "12th" and ordinal(13) == "13th" and ordinal(21) == "21st" and ordinal(22) == "22nd" and ordinal(101) == "101st" and ordinal(111) == "111th" and ordinal(112) == "112th" and ordinal(0) == "0th" and ordinal(-1) == "-1st" and ordinal(-12) == "-12th" and ordinal_suffix(1000003) == "rd" and ordinal(-9223372036854775807 - 1) == "-9223372036854775808th"
+
+test plurals_regular = pluralize("file") == "files" and pluralize("box") == "boxes" and pluralize("church") == "churches" and pluralize("dish") == "dishes" and pluralize("city") == "cities" and pluralize("day") == "days" and pluralize("buzz") == "buzzes" and pluralize("photo") == "photos" and pluralize("roof") == "roofs" and pluralize("") == ""
+
+test plurals_irregular = pluralize("person") == "people" and pluralize("child") == "children" and pluralize("leaf") == "leaves" and pluralize("analysis") == "analyses" and pluralize("cactus") == "cacti" and pluralize("quiz") == "quizzes" and pluralize("potato") == "potatoes" and pluralize("bus") == "buses" and pluralize("movie") == "movies" and pluralize("people") == "people" and pluralize("sheep") == "sheep" and pluralize("information") == "information"
+
+test plurals_case = pluralize("Box") == "Boxes" and pluralize("BOX") == "BOXES" and pluralize("Person") == "People" and pluralize("CITY") == "CITIES" and singularize("People") == "Person" and singularize("BOXES") == "BOX"
+
+test singulars = singularize("files") == "file" and singularize("boxes") == "box" and singularize("cities") == "city" and singularize("classes") == "class" and singularize("people") == "person" and singularize("wolves") == "wolf" and singularize("crises") == "crisis" and singularize("statuses") == "status" and singularize("movies") == "movie" and singularize("cookies") == "cookie" and singularize("sheep") == "sheep" and singularize("status") == "status" and singularize("class") == "class" and singularize("analysis") == "analysis" and singularize("file") == "file" and singularize("") == ""
+
+test plural_round_trip = ["file", "box", "city", "church", "person", "leaf", "crisis", "status", "movie", "quiz", "class", "day", "hero", "mouse", "datum"].all(w => singularize(pluralize(w)) == w)
+
+test counts = plural_for(1, "file") == "file" and plural_for(-1, "file") == "file" and plural_for(2, "file") == "files" and plural_for(0, "file") == "files" and count_noun(1, "file") == "1 file" and count_noun(1234, "file") == "1,234 files" and count_noun(0, "child") == "0 children" and quantity(0, "file") == "no files" and quantity(1, "file") == "1 file" and quantity(3, "person") == "3 people"
+
+test lists = join_list([]) == "" and join_list(["a"]) == "a" and join_list(["a", "b"]) == "a and b" and join_list(["a", "b", "c"]) == "a, b and c" and join_list_oxford(["a", "b", "c"]) == "a, b, and c" and join_list_oxford(["a", "b"]) == "a and b" and join_or(["a", "b", "c"]) == "a, b or c" and join_words(["x", "y", "z", "w"], "nor", true) == "x, y, z, nor w"
+
+test lists_truncated = join_truncated(["a", "b", "c", "d", "e"], 2) == "a, b and 3 others" and join_truncated(["a", "b", "c"], 2) == "a, b and 1 other" and join_truncated(["a", "b"], 2) == "a and b" and join_truncated(["a", "b"], 0) == "2 others" and join_truncated([], 0) == ""
+
+test separators = with_commas(0) == "0" and with_commas(999) == "999" and with_commas(1000) == "1,000" and with_commas(-1234567) == "-1,234,567" and with_commas(-9223372036854775807 - 1) == "-9,223,372,036,854,775,808" and group_digits(1234567, " ") == "1 234 567" and group_digits(1234567, "_") == "1_234_567" and with_commas_f64(-1234.5, 1) == "-1,234.5" and with_commas_f64(0.0 / 0.0, 2) == "nan" and with_commas_f64(1.0 / 0.0, 2) == "inf"
+
+test compacts = compact(0) == "0" and compact(999) == "999" and compact(1000) == "1k" and compact(1234) == "1.2k" and compact(1250) == "1.3k" and compact(3400000) == "3.4M" and compact(1200000000) == "1.2B" and compact(1000000000000) == "1T" and compact(-1500) == "-1.5k" and compact(999949) == "999.9k" and compact(999950) == "1M" and compact(999999999) == "1B" and compact(9223372036854775807) == "9,223,372T" and compact(-9223372036854775807 - 1) == "-9,223,372T"
+
+test compacts_long = compact_long(1234) == "1.2 thousand" and compact_long(3400000) == "3.4 million" and compact_long(1000000000) == "1 billion" and compact_long(2000000000000) == "2 trillion" and compact_long(12) == "12" and compact_with(1234567, 2, false) == "1.23M" and compact_with(1999, 0, false) == "2k" and compact_with(1000, 3, true) == "1 thousand"
+
+test compact_parse = parse_compact("1.2k") == some(1200) and parse_compact("3.4M") == some(3400000) and parse_compact("1.5 billion") == some(1500000000) and parse_compact("2T") == some(2000000000000) and parse_compact("-1,500") == some(-1500) and parse_compact("750") == some(750) and parse_compact("1.2345k") == some(1234) and parse_compact("2bn") == some(2000000000) and parse_compact("9,223,372T") == some(9223372000000000000) and parse_compact("9,300,000T") == none and parse_compact("1,5k") == none and parse_compact("1.2x") == none and parse_compact("") == none and parse_compact("k") == none
+
+test compact_round_trip = [0, 999, 1000, 1200, 3400000, 1200000000, -1500].all(n => parse_compact(compact(n)) == some(n))
+
+test words = number_words(0) == "zero" and number_words(7) == "seven" and number_words(13) == "thirteen" and number_words(42) == "forty-two" and number_words(100) == "one hundred" and number_words(123) == "one hundred twenty-three" and number_words(-5) == "minus five" and number_words(1002003) == "one million two thousand three" and number_words(1000000) == "one million" and number_words(90) == "ninety"
+
+test words_extreme = number_words(-9223372036854775807 - 1) == "minus nine quintillion two hundred twenty-three quadrillion three hundred seventy-two trillion thirty-six billion eight hundred fifty-four million seven hundred seventy-five thousand eight hundred eight" and number_words(9223372036854775807).ends_with("eight hundred seven")
+
+test ordinal_word_forms = ordinal_words(1) == "first" and ordinal_words(2) == "second" and ordinal_words(3) == "third" and ordinal_words(5) == "fifth" and ordinal_words(8) == "eighth" and ordinal_words(9) == "ninth" and ordinal_words(12) == "twelfth" and ordinal_words(20) == "twentieth" and ordinal_words(21) == "twenty-first" and ordinal_words(100) == "one hundredth" and ordinal_words(1000002) == "one million second" and ordinal_words(-3) == "minus third" and ordinal_words(0) == "zeroth" and ordinal_words(14) == "fourteenth"
+
+test ap_numbers = apnumber(0) == "zero" and apnumber(5) == "five" and apnumber(9) == "nine" and apnumber(10) == "10" and apnumber(-3) == "-3"
+
+test romans = to_roman(1) == "I" and to_roman(4) == "IV" and to_roman(9) == "IX" and to_roman(14) == "XIV" and to_roman(40) == "XL" and to_roman(3999) == "MMMCMXCIX" and to_roman(2026) == "MMXXVI" and from_roman("XIV") == some(14) and from_roman("MCMXCIV") == some(1994) and from_roman("MMMCMXCIX") == some(3999)
+
+test romans_strict = ["", "IIII", "IC", "VX", "MMMM", "xiv", "IIV", "XM", "VV", "ABC", "IL"].all(s => from_roman(s) == none) and (1..4000).all(n => from_roman(to_roman(n)) == some(n))
+
+test percents = percent(0.125, 1) == "12.5%" and percent(0.0, 0) == "0%" and percent(1.0, 2) == "100.00%" and percent(-0.5, 0) == "-50%" and percent_of(1, 3, 1) == "33.3%" and percent_of(2, -4, 0) == "-50%"
+
+test fractions = fraction(0.5, 10) == "1/2" and fraction(1.5, 10) == "1 1/2" and fraction(-2.75, 10) == "-2 3/4" and fraction(3.0, 10) == "3" and fraction(0.0, 10) == "0" and fraction(0.333333, 10) == "1/3" and fraction(0.001, 10) == "0" and fraction(0.999, 10) == "1" and fraction(-0.2, 100) == "-1/5"
+
+test fraction_pairs = fraction_parts(0.75, 100) == (3, 4) and fraction_parts(3.14159265, 10) == (22, 7) and fraction_parts(3.14159265, 1000) == (355, 113) and fraction_parts(-1.5, 2) == (-3, 2) and fraction_parts(0.1, 1) == (0, 1) and fraction_parts(2.0, 5) == (2, 1)
+
+test sci = scientific(12345.0, 2) == "1.23 x 10⁴" and scientific(0.00042, 1) == "4.2 x 10⁻⁴" and scientific(0.0, 2) == "0.00 x 10⁰" and scientific(-1e100, 0) == "-1 x 10¹⁰⁰" and scientific(1.0 / 0.0, 2) == "inf" and scientific(0.0 / 0.0, 2) == "nan"
+
+test metrics = metric(1500.0, "V", 2) == "1.5 kV" and metric(2e-6, "F", 1) == "2 µF" and metric(0.0, "m", 1) == "0 m" and metric(999.96, "", 1) == "1 k" and metric(-0.0025, "A", 2) == "-2.5 mA" and metric(5.0, "g", 0) == "5 g" and metric(1e30, "W", 0) == "1000000 YW" and metric(0.0 / 0.0, "V", 1) == "nan V"
